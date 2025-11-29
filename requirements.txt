@@ -1,4 +1,4 @@
-torch
+torch==2.5.0
 diffusers>=0.30.0
 datasets>=2.18.0
 tqdm>=4.66.0

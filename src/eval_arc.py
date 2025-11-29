@@ -2,23 +2,34 @@
 from __future__ import annotations
 
 import argparse
-import json
+import random
 
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
 from arc_model import ArcFlux
+from arc_dataset import (
+    MAX_SEQ_LEN,
+    MAX_CONTEXT_PAIRS,  # still imported but effectively 0
+    PAD_TOKEN_ID,
+    SEP_TOKEN_ID,
+)
 
 
 def parse_args():
-    p = argparse.ArgumentParser("Evaluate ArcFlux on ARC-AGI-1 evaluation split")
+    p = argparse.ArgumentParser("Standalone evaluation of ArcFlux on ARC-AGI-1")
     p.add_argument("--ckpt", type=str, required=True,
                   help="Path to model checkpoint (.pt) from train_arc.py")
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--num_steps", type=int, default=64,
+    p.add_argument("--num_steps", type=int, default=100,
                   help="Diffusion inference steps")
-    p.add_argument("--out", type=str, default="arc_eval_predictions.json")
+    p.add_argument("--num_samples", type=int, default=8,
+                  help="Number of samples per test grid")
+    p.add_argument("--max_tasks", type=int, default=40,
+                  help="Max number of random eval tasks")
+    p.add_argument("--seed", type=int, default=0,
+                  help="Random seed for task sampling")
     return p.parse_args()
 
 
@@ -34,6 +45,13 @@ def grids_equal(a, b):
     return True
 
 
+def print_grid(name: str, grid):
+    print(f"{name}:")
+    for row in grid:
+        print(" " + " ".join(str(int(x)) for x in row))
+    print()
+
+
 def build_model(device: torch.device) -> ArcFlux:
     model_config = {
         "num_layers": 6,
@@ -43,12 +61,30 @@ def build_model(device: torch.device) -> ArcFlux:
         "num_attention_heads": 8,
         "joint_attention_dim": 512,
         "pooled_projection_dim": 512,
-        "max_seq_len": 30 * 30 * 2,
+        "max_seq_len": MAX_SEQ_LEN,
         "num_colors": 10,
-        "pad_token_id": 10,
+        "pad_token_id": PAD_TOKEN_ID,
     }
     model = ArcFlux(model_config).to(device)
+    if hasattr(model.transformer, "enable_gradient_checkpointing"):
+        model.transformer.enable_gradient_checkpointing()
     return model
+
+
+def build_eval_prefix_tokens(
+    row: dict,
+    test_pair: dict,
+    max_context_pairs: int = MAX_CONTEXT_PAIRS,  # unused, kept for signature
+) -> list[int]:
+    """
+    Eval-time prefix:
+      [SEP, test_input_flattened]
+    """
+    prefix_tokens: list[int] = []
+    test_inp = torch.tensor(test_pair["input"], dtype=torch.long).flatten().tolist()
+    prefix_tokens.append(SEP_TOKEN_ID)
+    prefix_tokens.extend(test_inp)
+    return prefix_tokens
 
 
 def main():
@@ -60,67 +96,94 @@ def main():
     model.load_state_dict(state)
     model.eval()
 
-    ds_eval = load_dataset("dataartist/arc-agi")["evaluation"]
+    raw = load_dataset("dataartist/arc-agi")["evaluation"]
 
-    all_results = {}
+    # sample tasks
+    indices = list(range(len(raw)))
+    rnd = random.Random(args.seed)
+    rnd.shuffle(indices)
+    indices = indices[: args.max_tasks]
+    ds_eval = [raw[i] for i in indices]
+
     total = 0
     correct = 0
 
-    for row in tqdm(ds_eval, desc="Evaluating tasks"):
-        task_id = row["id"]
-        task_results = []
+    outer = tqdm(
+        ds_eval,
+        desc=f"Eval ({args.num_steps} steps, {args.num_samples} samples, {len(ds_eval)} tasks)",
+        total=len(ds_eval),
+    )
 
-        # we do NOT feed the train examples as prefix here; we only use the test input itself
-        for i, test_pair in enumerate(row["test"]):
-            inp = torch.tensor(test_pair["input"], dtype=torch.long)   # (H_in, W_in)
-            gt_out = test_pair["output"]
+    with torch.no_grad():
+        for row in outer:
+            task_id = row["id"]
 
-            H_out = len(gt_out)
-            W_out = len(gt_out[0]) if H_out > 0 else 0
+            for j, test_pair in enumerate(row["test"]):
+                gt_out = test_pair["output"]
+                H_out = len(gt_out)
+                W_out = len(gt_out[0]) if H_out > 0 else 0
+                target_len = H_out * W_out
 
-            prefix_ids = inp.view(1, -1)  # (1, L_prefix)
+                prefix_tokens = build_eval_prefix_tokens(row, test_pair)
+                prefix_len = len(prefix_tokens)
+                if prefix_len + target_len > MAX_SEQ_LEN:
+                    max_prefix_len = MAX_SEQ_LEN - target_len
+                    if max_prefix_len <= 0:
+                        prefix_tokens = []
+                    else:
+                        prefix_tokens = prefix_tokens[-max_prefix_len:]
 
-            with torch.no_grad():
-                pred_grid_ids = model.sample_with_prefix(
-                    prefix_ids.to(device),
-                    out_height=H_out,
-                    out_width=W_out,
-                    num_inference_steps=args.num_steps,
-                )
+                prefix_ids = torch.tensor(
+                    prefix_tokens, dtype=torch.long, device=device
+                ).unsqueeze(0)
 
-            pred_grid = pred_grid_ids.cpu().numpy()[0].tolist()
+                success = False
+                first_pred = None
+                final_pred = None
+                hit_sample = None
 
-            is_correct = grids_equal(pred_grid, gt_out)
-            total += 1
-            correct += int(is_correct)
+                for s in range(args.num_samples):
+                    pred_ids = model.sample_with_prefix(
+                        prefix_ids,
+                        out_height=H_out,
+                        out_width=W_out,
+                        num_inference_steps=args.num_steps,
+                    )
+                    pred_grid = pred_ids.cpu().numpy()[0].tolist()
+                    if first_pred is None:
+                        first_pred = pred_grid
 
-            task_results.append(
-                {
-                    "test_index": i,
-                    "input": test_pair["input"],
-                    "predicted": pred_grid,
-                    "ground_truth": gt_out,
-                    "correct": bool(is_correct),
-                }
-            )
+                    if grids_equal(pred_grid, gt_out):
+                        success = True
+                        final_pred = pred_grid
+                        hit_sample = s + 1
+                        break
 
-        all_results[task_id] = task_results
+                if success:
+                    print(
+                        f"[PASS] task {task_id} test {j} "
+                        f"(hit at sample {hit_sample}/{args.num_samples})"
+                    )
+                else:
+                    print(
+                        f"[FAIL] task {task_id} test {j} "
+                        f"(no match in {args.num_samples} samples)"
+                    )
+
+                pred_to_show = final_pred if (success and final_pred is not None) else first_pred
+                print_grid("INPUT", test_pair["input"])
+                if pred_to_show is not None:
+                    print_grid("PRED", pred_to_show)
+                print_grid("GT", gt_out)
+                print("-" * 40)
+
+                correct += int(success)
+                total += 1
+                outer.set_postfix(acc=f"{correct / max(total, 1):.3f}")
 
     accuracy = correct / max(total, 1)
-    print(f"Exact grid accuracy on evaluation split: {accuracy*100:.2f}% "
+    print(f"Exact grid accuracy on sampled tasks: {accuracy*100:.2f}% "
           f"({correct}/{total})")
-
-    with open(args.out, "w") as f:
-        json.dump(
-            {
-                "checkpoint": args.ckpt,
-                "accuracy": accuracy,
-                "results": all_results,
-            },
-            f,
-            indent=2,
-        )
-    print(f"Wrote predictions to {args.out}")
 
 
 if __name__ == "__main__":
