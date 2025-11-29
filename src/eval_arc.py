@@ -1,10 +1,8 @@
 # eval_arc.py
-
 from __future__ import annotations
 
 import argparse
 import json
-import os
 
 import torch
 from datasets import load_dataset
@@ -36,11 +34,7 @@ def grids_equal(a, b):
     return True
 
 
-def main():
-    args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-
-    # Model config must match training
+def build_model(device: torch.device) -> ArcFlux:
     model_config = {
         "num_layers": 6,
         "num_single_layers": 18,
@@ -53,8 +47,15 @@ def main():
         "num_colors": 10,
         "pad_token_id": 10,
     }
-
     model = ArcFlux(model_config).to(device)
+    return model
+
+
+def main():
+    args = parse_args()
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    model = build_model(device)
     state = torch.load(args.ckpt, map_location=device)
     model.load_state_dict(state)
     model.eval()
