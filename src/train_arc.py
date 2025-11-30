@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import random
 
 import torch
 from torch.optim import AdamW
@@ -13,21 +12,15 @@ import wandb
 from datasets import load_dataset
 
 from arc_model import ArcFlux
-from arc_dataset import (
-    ArcHFDataset,
-    MAX_SEQ_LEN,
-    MAX_CONTEXT_PAIRS,
-    PAD_TOKEN_ID,
-    SEP_TOKEN_ID,
-)
+from arc_dataset import ArcHFDataset
 
 
 def parse_args():
-    p = argparse.ArgumentParser("Train ArcFlux on ARC-AGI-1 with W&B + full eval")
+    p = argparse.ArgumentParser("Train ArcFlux on ARC-AGI-1 with W&B logging")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=5e-5)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=5e-5)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--save_dir", type=str, default="checkpoints_arc")
 
@@ -38,16 +31,10 @@ def parse_args():
                    help="Disable wandb logging")
 
     # eval settings
-    p.add_argument("--eval_steps", type=int, default=100,
+    p.add_argument("--eval_steps", type=int, default=32,
                    help="Diffusion steps to use for full eval")
-    p.add_argument("--eval_samples", type=int, default=4,
-                   help="Number of samples per test grid for full eval")
     p.add_argument("--full_eval_interval", type=int, default=2,
-                   help="Run full eval every N epochs")
-    p.add_argument("--eval_max_tasks", type=int, default=40,
-                   help="Max number of random eval tasks to use in full eval")
-    p.add_argument("--eval_seed", type=int, default=0,
-                   help="Base random seed for sampling eval tasks")
+                   help="Run full eval every N epochs (default 2)")
 
     return p.parse_args()
 
@@ -61,13 +48,13 @@ def build_model(device: torch.device) -> ArcFlux:
         "num_attention_heads": 8,
         "joint_attention_dim": 512,
         "pooled_projection_dim": 512,
-        "max_seq_len": MAX_SEQ_LEN,
+        "max_seq_len": 30 * 30 * 2,
         "num_colors": 10,
-        "pad_token_id": PAD_TOKEN_ID,
+        "pad_token_id": 10,
     }
     model = ArcFlux(model_config).to(device)
 
-    # gradient checkpointing saves memory (if available)
+    # gradient checkpointing saves memory
     if hasattr(model.transformer, "enable_gradient_checkpointing"):
         model.transformer.enable_gradient_checkpointing()
 
@@ -106,139 +93,43 @@ def grids_equal(a, b):
     return True
 
 
-def print_grid(name: str, grid):
-    """
-    Print a 2D grid (list of lists of ints) as ASCII.
-    """
-    print(f"{name}:")
-    for row in grid:
-        print(" " + " ".join(str(int(x)) for x in row))
-    print()
-
-
-def build_eval_prefix_tokens(
-    row: dict,
-    test_pair: dict,
-    max_context_pairs: int = MAX_CONTEXT_PAIRS,  # unused, kept for signature
-) -> list[int]:
-    """
-    Eval-time prefix (matches dataset now):
-      [SEP, test_input_flattened]
-    """
-    prefix_tokens: list[int] = []
-    test_inp = torch.tensor(test_pair["input"], dtype=torch.long).flatten().tolist()
-    prefix_tokens.append(SEP_TOKEN_ID)
-    prefix_tokens.extend(test_inp)
-    return prefix_tokens
-
-
 def evaluate_accuracy_full(
     model: ArcFlux,
     device: torch.device,
-    num_steps: int = 100,
-    num_samples: int = 4,
-    max_tasks: int = 40,
-    seed: int = 0,
+    num_steps: int = 32,
 ) -> float:
     """
-    Full accuracy eval on a RANDOM subset of ARC-AGI-1 evaluation tasks, using:
-      - num_steps diffusion steps,
-      - num_samples samples per grid,
-      - up to max_tasks tasks sampled with given seed,
-    and printing ASCII grids for a subset of cases.
+    Full accuracy eval on ARC-AGI-1 evaluation split, like eval_arc.py,
+    but without writing JSON to disk.
     """
     model.eval()
-    raw = load_dataset("dataartist/arc-agi")["evaluation"]
-
-    # sample tasks
-    indices = list(range(len(raw)))
-    rnd = random.Random(seed)
-    rnd.shuffle(indices)
-    indices = indices[: max_tasks]
-    ds_eval = [raw[i] for i in indices]
+    ds_eval = load_dataset("dataartist/arc-agi")["evaluation"]
 
     total = 0
     correct = 0
 
-    # limit the number of grids we print to avoid spam
-    max_print = 20
-    printed = 0
-
-    outer = tqdm(
-        ds_eval,
-        desc=f"Full eval ({num_steps} steps, {num_samples} samples, {len(ds_eval)} tasks)",
-        total=len(ds_eval),
-    )
-
     with torch.no_grad():
-        for row in outer:
-            task_id = row["id"]
-            for j, test_pair in enumerate(row["test"]):
+        for row in ds_eval:
+            for test_pair in row["test"]:
+                inp = torch.tensor(test_pair["input"], dtype=torch.long)   # (H_in, W_in)
                 gt_out = test_pair["output"]
+
                 H_out = len(gt_out)
                 W_out = len(gt_out[0]) if H_out > 0 else 0
-                target_len = H_out * W_out
 
-                # ---- build prefix: just this test input ----
-                prefix_tokens = build_eval_prefix_tokens(row, test_pair)
-                prefix_len = len(prefix_tokens)
-                if prefix_len + target_len > MAX_SEQ_LEN:
-                    max_prefix_len = MAX_SEQ_LEN - target_len
-                    if max_prefix_len <= 0:
-                        prefix_tokens = []
-                    else:
-                        prefix_tokens = prefix_tokens[-max_prefix_len:]
+                prefix_ids = inp.view(1, -1).to(device)  # (1, L_prefix)
 
-                prefix_ids = torch.tensor(
-                    prefix_tokens, dtype=torch.long, device=device
-                ).unsqueeze(0)  # (1, L_prefix)
+                pred_ids = model.sample_with_prefix(
+                    prefix_ids,
+                    out_height=H_out,
+                    out_width=W_out,
+                    num_inference_steps=num_steps,
+                )
+                pred_grid = pred_ids.cpu().numpy()[0].tolist()
 
-                success = False
-                first_pred = None
-                final_pred = None
-                hit_sample = None
-
-                for s in range(num_samples):
-                    pred_ids = model.sample_with_prefix(
-                        prefix_ids,
-                        out_height=H_out,
-                        out_width=W_out,
-                        num_inference_steps=num_steps,
-                    )
-                    pred_grid = pred_ids.cpu().numpy()[0].tolist()
-                    if first_pred is None:
-                        first_pred = pred_grid
-
-                    if grids_equal(pred_grid, gt_out):
-                        success = True
-                        final_pred = pred_grid
-                        hit_sample = s + 1
-                        break
-
-                if success:
-                    print(
-                        f"[PASS] task {task_id} test {j} "
-                        f"(hit at sample {hit_sample}/{num_samples})"
-                    )
-                else:
-                    print(
-                        f"[FAIL] task {task_id} test {j} "
-                        f"(no match in {num_samples} samples)"
-                    )
-
-                # Print grids for first few cases
-                if printed < max_print:
-                    pred_to_show = final_pred if (success and final_pred is not None) else first_pred
-                    print_grid("INPUT", test_pair["input"])
-                    if pred_to_show is not None:
-                        print_grid("PRED", pred_to_show)
-                    print_grid("GT", gt_out)
-                    print("-" * 40)
-                    printed += 1
-
-                correct += int(success)
+                if grids_equal(pred_grid, gt_out):
+                    correct += 1
                 total += 1
-                outer.set_postfix(acc=f"{correct / max(total, 1):.3f}")
 
     model.train()
     return correct / max(total, 1)
@@ -254,16 +145,12 @@ def main():
     train_dataset = ArcHFDataset(
         split="training",
         use_test_targets=True,
-        pad_token_id=PAD_TOKEN_ID,
-        max_context_pairs=MAX_CONTEXT_PAIRS,
-        max_seq_len=MAX_SEQ_LEN,
+        pad_token_id=10,
     )
     eval_dataset = ArcHFDataset(
         split="evaluation",
         use_test_targets=True,
-        pad_token_id=PAD_TOKEN_ID,
-        max_context_pairs=MAX_CONTEXT_PAIRS,
-        max_seq_len=MAX_SEQ_LEN,
+        pad_token_id=10,
     )
 
     train_loader = DataLoader(
@@ -303,11 +190,7 @@ def main():
                 "lr": args.lr,
                 "weight_decay": args.weight_decay,
                 "eval_steps": args.eval_steps,
-                "eval_samples": args.eval_samples,
                 "full_eval_interval": args.full_eval_interval,
-                "eval_max_tasks": args.eval_max_tasks,
-                "max_seq_len": MAX_SEQ_LEN,
-                "max_context_pairs": MAX_CONTEXT_PAIRS,
             },
         )
         wandb.watch(model, log="gradients", log_freq=100)
@@ -351,14 +234,8 @@ def main():
         )
 
         if run_full_eval:
-            # vary seed by epoch so we see different task subsets
             eval_acc = evaluate_accuracy_full(
-                model,
-                device,
-                num_steps=args.eval_steps,
-                num_samples=args.eval_samples,
-                max_tasks=args.eval_max_tasks,
-                seed=args.eval_seed + epoch_num,
+                model, device, num_steps=args.eval_steps
             )
             print(
                 f"Epoch {epoch_num}: "

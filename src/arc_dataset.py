@@ -1,132 +1,128 @@
 # arc_dataset.py
+
 from __future__ import annotations
 
-from typing import List
+from typing import List, Dict, Any
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset
 
-# --- shared token + length constants ---
-NUM_COLORS = 10           # 0..9
-PAD_TOKEN_ID = 10         # padding
-SEP_TOKEN_ID = 11         # separator for grids / IO blocks
-MAX_CONTEXT_PAIRS = 0     # DISABLED: no extra IO context, just the current input
-MAX_SEQ_LEN = 2048        # total sequence length (prefix + target + PAD)
-
 
 class ArcHFDataset(Dataset):
     """
-    ARC-AGI dataset from dataartist/arc-agi.
+    Wraps dataartist/arc-agi (ARC-AGI-1) from Hugging Face.
 
-    For each sample:
-      - Choose a target pair (input, output) from this task (train+test if use_test_targets=True).
-      - Build prefix tokens:
+    Each item is one (input, output) pair from a task's train or test list,
+    turned into a sequence [input_flat ; output_flat].
 
-          [SEP, target_input_flattened]
-
-      - Suffix tokens (to be inpainted) = target_output_flattened.
-
-      - If prefix + suffix > max_seq_len, crop prefix from the left so that
-        prefix_len + target_len <= max_seq_len.
-
-    Returns:
-      seq_ids:     (MAX_SEQ_LEN,) long
-      prefix_len:  () long scalar (how many tokens belong to prefix)
-      target_mask: (MAX_SEQ_LEN,) bool (True where suffix tokens live)
-      out_shape:   (2,) long [H_out, W_out]
-      sample_id:   string (task_id:local_idx)
+    Args:
+        split: "training" or "evaluation"
+        use_test_targets:
+            If True, also use the 'test' pairs from that split as supervised
+            training examples (useful for "train on train+test" on the training
+            split, as you mentioned).
+        pad_token_id: which token index is used as PAD (must match model).
     """
 
     def __init__(
         self,
         split: str = "training",
         use_test_targets: bool = True,
-        pad_token_id: int = PAD_TOKEN_ID,
-        max_context_pairs: int = MAX_CONTEXT_PAIRS,  # kept for API, but unused now
-        max_seq_len: int = MAX_SEQ_LEN,
+        pad_token_id: int = 10,
     ):
         super().__init__()
         self.split = split
         self.pad_token_id = pad_token_id
-        self.sep_token_id = SEP_TOKEN_ID
-        self.max_seq_len = max_seq_len
-        self.use_test_targets = use_test_targets
 
-        self.hf_ds = load_dataset("dataartist/arc-agi")[split]
+        hf_ds = load_dataset("dataartist/arc-agi")[split]  # 400 rows per split
 
-        # index: list of (task_idx, target_idx, n_train, n_all)
-        self.index: List[tuple[int, int, int, int]] = []
-        for task_idx, row in enumerate(self.hf_ds):
-            train_pairs = row["train"]
-            test_pairs = row["test"]
-            all_pairs = train_pairs + (test_pairs if use_test_targets else [])
-            n_train = len(train_pairs)
-            n_all = len(all_pairs)
-            for local_idx in range(n_all):
-                self.index.append((task_idx, local_idx, n_train, n_all))
+        self.samples: List[Dict[str, Any]] = []
+
+        for row in hf_ds:
+            task_id = row["id"]
+            # training pairs for the task
+            for k, pair in enumerate(row["train"]):
+                self.samples.append(
+                    {
+                        "input": np.asarray(pair["input"], dtype=np.int64),
+                        "output": np.asarray(pair["output"], dtype=np.int64),
+                        "task_id": task_id,
+                        "kind": "train",
+                        "idx": k,
+                    }
+                )
+            # optionally also use test pairs as supervised examples
+            if use_test_targets:
+                for k, pair in enumerate(row["test"]):
+                    self.samples.append(
+                        {
+                            "input": np.asarray(pair["input"], dtype=np.int64),
+                            "output": np.asarray(pair["output"], dtype=np.int64),
+                            "task_id": task_id,
+                            "kind": "test",
+                            "idx": k,
+                        }
+                    )
 
     def __len__(self) -> int:
-        return len(self.index)
+        return len(self.samples)
 
     def __getitem__(self, idx: int):
-        task_idx, target_idx, n_train, n_all = self.index[idx]
-        row = self.hf_ds[task_idx]
-        train_pairs = row["train"]
-        test_pairs = row["test"]
-        all_pairs = train_pairs + (test_pairs if self.use_test_targets else [])
+        return self.samples[idx]
 
-        target_pair = all_pairs[target_idx]
+    def collate_fn(self, batch):
+        """
+        For each sample:
+          - flatten input and output grids
+          - concatenate into seq = [input_flat ; output_flat]
+          - record prefix_len = len(input_flat) and where the output lives
+        Returns:
+          seq_ids:    (B, L_max) long
+          prefix_lens:(B,) long
+          target_mask:(B, L_max) bool
+          out_shapes: (B, 2) long  (H_out, W_out)
+          sample_ids: list[str]
+        """
+        pad_id = self.pad_token_id
+        B = len(batch)
 
-        # --- target input/output ---
-        t_inp_arr = np.array(target_pair["input"], dtype=np.int64)
-        t_out_arr = np.array(target_pair["output"], dtype=np.int64)
+        seqs: List[torch.LongTensor] = []
+        prefix_lens_list: List[int] = []
+        target_lens_list: List[int] = []
+        out_shapes = torch.zeros(B, 2, dtype=torch.long)
+        sample_ids: List[str] = []
 
-        H_out, W_out = t_out_arr.shape
-        t_inp_flat = t_inp_arr.flatten()
-        t_out_flat = t_out_arr.flatten()
+        for i, sample in enumerate(batch):
+            inp = torch.from_numpy(sample["input"]).long()
+            out = torch.from_numpy(sample["output"]).long()
 
-        # --- prefix = [SEP, input_flat] ---
-        prefix_tokens = [self.sep_token_id]
-        prefix_tokens.extend(t_inp_flat.tolist())
+            H_out, W_out = out.shape
+            out_shapes[i, 0] = H_out
+            out_shapes[i, 1] = W_out
 
-        prefix_len = len(prefix_tokens)
-        target_len = t_out_flat.size
-        max_total = self.max_seq_len
+            inp_flat = inp.view(-1)   # (L_in,)
+            out_flat = out.view(-1)   # (L_out,)
+            seq = torch.cat([inp_flat, out_flat], dim=0)  # (L_in+L_out,)
 
-        # --- crop prefix if too long ---
-        if prefix_len + target_len > max_total:
-            max_prefix_len = max_total - target_len
-            if max_prefix_len <= 0:
-                prefix_tokens = []
-                prefix_len = 0
-            else:
-                prefix_tokens = prefix_tokens[-max_prefix_len:]
-                prefix_len = len(prefix_tokens)
+            seqs.append(seq)
+            prefix_lens_list.append(inp_flat.numel())
+            target_lens_list.append(out_flat.numel())
+            sample_ids.append(f"{sample['task_id']}:{sample['kind']}:{sample['idx']}")
 
-        seq = prefix_tokens + t_out_flat.tolist()
-        L = len(seq)
+        prefix_lens = torch.tensor(prefix_lens_list, dtype=torch.long)
+        target_lens = torch.tensor(target_lens_list, dtype=torch.long)
 
-        seq_ids = torch.full((self.max_seq_len,), self.pad_token_id, dtype=torch.long)
-        seq_ids[:L] = torch.tensor(seq, dtype=torch.long)
+        L_max = max(s.size(0) for s in seqs)
+        seq_ids = torch.full((B, L_max), pad_id, dtype=torch.long)
+        target_mask = torch.zeros((B, L_max), dtype=torch.bool)
 
-        target_mask = torch.zeros(self.max_seq_len, dtype=torch.bool)
-        start = prefix_len
-        end = min(prefix_len + target_len, self.max_seq_len)
-        target_mask[start:end] = True
+        for i, seq in enumerate(seqs):
+            L = seq.size(0)
+            seq_ids[i, :L] = seq
+            start = prefix_lens[i].item()
+            end = start + target_lens[i].item()
+            target_mask[i, start:end] = True
 
-        out_shape = torch.tensor([H_out, W_out], dtype=torch.long)
-        sample_id = f"{row['id']}:{target_idx}"
-        prefix_len_tensor = torch.tensor(prefix_len, dtype=torch.long)
-
-        return seq_ids, prefix_len_tensor, target_mask, out_shape, sample_id
-
-    @staticmethod
-    def collate_fn(batch):
-        seq_ids = torch.stack([b[0] for b in batch], dim=0)      # (B, L)
-        prefix_lens = torch.stack([b[1] for b in batch], dim=0)  # (B,)
-        target_masks = torch.stack([b[2] for b in batch], dim=0) # (B, L)
-        out_shapes = torch.stack([b[3] for b in batch], dim=0)   # (B, 2)
-        sample_ids = [b[4] for b in batch]                       # list[str]
-        return seq_ids, prefix_lens, target_masks, out_shapes, sample_ids
+        return seq_ids, prefix_lens, target_mask, out_shapes, sample_ids

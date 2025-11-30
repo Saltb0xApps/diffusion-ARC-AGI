@@ -42,17 +42,20 @@ class ArcFlux(nn.Module):
     Diffusion / flow-matching model for ARC.
 
     Training input:
-      - seq_ids:     (B, L_max) containing [prefix_tokens ; target_output ; PAD]
-      - prefix_lens: (B,)       number of prefix tokens per sample
-      - target_mask: (B, L_max) True on target_output positions
+      - seq_ids: (B, L_max) containing [input_flat ; output_flat ; PAD]
+      - prefix_lens: number of input tokens per sample
+      - target_mask: True on output tokens, False elsewhere
 
-    Conditioning:
-      - encoder_hidden_states = projection of prefix tokens only.
-      - pooled_projection    = mean over prefix positions.
+    During training we:
+      - Embed the whole sequence.
+      - Use only the prefix (input cells) as conditioning.
+      - Noise only the output region.
+      - Predict noise - latents (flow).
 
-    Inference:
-      - sample_with_prefix takes arbitrary prefix_ids and infills a suffix of
-        length H_out * W_out.
+    At inference we:
+      - Take flattened input as prefix.
+      - Append random noise tokens for the output region.
+      - Iteratively denoise while freezing the prefix.
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -69,20 +72,15 @@ class ArcFlux(nn.Module):
         )
 
         self.num_colors = config.get("num_colors", 10)  # 0..9
-        self.pad_token_id = config.get("pad_token_id", self.num_colors)
+        self.pad_token_id = config.get("pad_token_id", 10)  # +1 PAD
 
         # Flow-matching scheduler
         self.noise_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
         self.noise_scheduler_copy = copy.deepcopy(self.noise_scheduler)
 
-        # Discrete token embedding: colors + PAD + SEP
-        vocab_size = self.num_colors + 2
+        # Discrete color embedding
+        vocab_size = self.num_colors + 1
         self.token_embed = nn.Embedding(vocab_size, self.in_channels)
-
-        # Prefer PAD embedding being zero
-        with torch.no_grad():
-            if 0 <= self.pad_token_id < vocab_size:
-                self.token_embed.weight[self.pad_token_id].zero_()
 
         # Prefix -> conditioning states
         self.cond_proj = nn.Linear(self.in_channels, self.joint_attention_dim)
@@ -104,6 +102,11 @@ class ArcFlux(nn.Module):
             pooled_projection_dim=self.pooled_projection_dim,
             guidance_embeds=False,
         )
+
+        # Initialise PAD embedding as zero to make it neutral
+        with torch.no_grad():
+            if 0 <= self.pad_token_id < vocab_size:
+                self.token_embed.weight[self.pad_token_id].zero_()
 
     @property
     def device(self) -> torch.device:
@@ -127,10 +130,17 @@ class ArcFlux(nn.Module):
         prefix_lens: torch.LongTensor, # (B,)
         target_mask: torch.BoolTensor, # (B, L_max)
     ):
+        """
+        One training step, Flow Matching style.
+
+        seq_ids contains color IDs (0..9) and PAD (10).
+        prefix_lens[i] tells us how many initial tokens belong to the input grid.
+        target_mask[i,j] = True iff seq_ids[i,j] is part of the output grid.
+        """
         device = seq_ids.device
         bsz, L_max = seq_ids.shape
 
-        # --- Embedding for [prefix ; target_output ; PAD] ---
+        # --- Embedding for [input; output] ---
         latents = self.token_embed(seq_ids)  # (B, L_max, D)
 
         # --- Build encoder_hidden_states from prefix tokens only ---
@@ -138,7 +148,7 @@ class ArcFlux(nn.Module):
         max_prefix = int(prefix_lens.max().item()) if bsz > 0 else 0
 
         if max_prefix == 0:
-            # Degenerate: no prefix, fall back to projecting everything
+            # Degenerate case: no prefix; fall back to averaging everything
             cond_hidden = self.cond_proj(latents)  # (B, L_max, joint_dim)
             cond_mask = torch.ones(bsz, L_max, dtype=torch.bool, device=device)
         else:
@@ -175,7 +185,7 @@ class ArcFlux(nn.Module):
 
         sigma_full = sigmas.expand(-1, L_max, -1)  # (B, L_max, 1)
 
-        # Only noise the target region
+        # Only noise the target (output) region
         target_mask = target_mask.to(device)
         target_mask_3d = target_mask.unsqueeze(-1)                 # (B, L_max, 1)
 
@@ -185,16 +195,17 @@ class ArcFlux(nn.Module):
             latents,
         )
 
-        # --- Positional ids for Flux (broadcasted) ---
+        # --- Positional ids for Flux ---
         img_ids = (
             torch.arange(L_max, device=device)
+            .unsqueeze(0)
             .unsqueeze(-1)
-            .repeat(1, 3)
-        )  # (L_max, 3)
+            .repeat(bsz, 1, 3)
+        )  # (B, L_max, 3)
 
         txt_ids = torch.zeros(
-            cond_hidden.shape[1], 3, device=device
-        )  # (max_prefix, 3)
+            bsz, cond_hidden.shape[1], 3, device=device
+        )  # (B, max_prefix, 3)
 
         # --- Forward Flux transformer ---
         model_pred = self.transformer(
@@ -208,6 +219,7 @@ class ArcFlux(nn.Module):
             return_dict=False,
         )[0]  # (B, L_max, D)
 
+        # Flow Matching target: vector field from latents to noise
         flow_target = noise - latents
 
         mse = (model_pred.float() - flow_target.float()) ** 2
@@ -227,8 +239,8 @@ class ArcFlux(nn.Module):
         """
         Prefix + infill sampling.
 
-        prefix_ids: flattened prefix tokens (colors + SEP).
-        out_height, out_width: shape of desired output grid.
+        prefix_ids: flattened input grid colors (0..9)
+        out_height, out_width: desired output grid shape.
 
         Returns:
             (B, out_height, out_width) integer color grids in [0..9]
@@ -265,16 +277,17 @@ class ArcFlux(nn.Module):
 
         img_ids = (
             torch.arange(L_total, device=device)
+            .unsqueeze(0)
             .unsqueeze(-1)
-            .repeat(1, 3)
-        )  # (L_total, 3)
-
-        txt_ids = torch.zeros(
-            cond_hidden.shape[1], 3, device=device
-        )  # (Lp, 3)
+            .repeat(bsz, 1, 3)
+        )
 
         for t in timesteps:
             t_tensor = torch.full((bsz,), float(t / 1000.0), device=device)
+
+            txt_ids = torch.zeros(
+                bsz, cond_hidden.shape[1], 3, device=device
+            )
 
             noise_pred = self.transformer(
                 hidden_states=latents,
