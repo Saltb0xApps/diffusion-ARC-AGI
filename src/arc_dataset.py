@@ -9,16 +9,19 @@ import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset
 
+import random
+import json
+
 
 class ArcHFDataset(Dataset):
     """
-    Wraps dataartist/arc-agi (ARC-AGI-1) from Hugging Face.
+    Wraps ARC-AGI-1 from Hugging Face.
 
     Each item is one (input, output) pair from a task's train or test list,
     turned into a sequence [input_flat ; output_flat].
 
     Args:
-        split: "training" or "evaluation"
+        split: "train" or "evaluation"
         use_test_targets:
             If True, also use the 'test' pairs from that split as supervised
             training examples (useful for "train on train+test" on the training
@@ -28,22 +31,39 @@ class ArcHFDataset(Dataset):
 
     def __init__(
         self,
-        split: str = "training",
+        split: str = "train",
         use_test_targets: bool = True,
         pad_token_id: int = 10,
+        dataset_id: str = "Asap7772/arc-agi-mixed-barc",
     ):
         super().__init__()
         self.split = split
         self.pad_token_id = pad_token_id
 
-        hf_ds = load_dataset("dataartist/arc-agi")[split]  # 400 rows per split
+        hf_ds = load_dataset(dataset_id)[split]  # 9.6k rows
 
         self.samples: List[Dict[str, Any]] = []
 
         for row in hf_ds:
-            task_id = row["id"]
+            # check if row train is string or list
+            if isinstance(row["train"], str):
+                train_pairs = json.loads(row["train"])
+            else:
+                train_pairs = row["train"]
+
+            if isinstance(row["test"], str):
+                test_pairs = json.loads(row["test"])
+            else:
+                test_pairs = row["test"]
+
+            # you can make a synthetic task_id from row index or hash
+            task_id = row.get("task_id", None)
+            if task_id is None:
+                # fall back to a deterministic synthetic id if needed
+                task_id = row.get("id", None) or f"mixed_{len(self.samples)}"
+
             # training pairs for the task
-            for k, pair in enumerate(row["train"]):
+            for k, pair in enumerate(train_pairs):
                 self.samples.append(
                     {
                         "input": np.asarray(pair["input"], dtype=np.int64),
@@ -55,7 +75,7 @@ class ArcHFDataset(Dataset):
                 )
             # optionally also use test pairs as supervised examples
             if use_test_targets:
-                for k, pair in enumerate(row["test"]):
+                for k, pair in enumerate(test_pairs):
                     self.samples.append(
                         {
                             "input": np.asarray(pair["input"], dtype=np.int64),

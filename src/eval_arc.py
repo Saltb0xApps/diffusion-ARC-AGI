@@ -43,21 +43,13 @@ def grids_equal(a, b):
 
 def grid_to_ascii(grid):
     """
-    Convert a 2D grid of integers into simple ASCII art.
-    Values 0..9 are mapped to a fixed palette.
+    Represent a 2D integer grid as a string of numbers, one row per line.
     """
-    palette = " .,:;ox%#@"  # 10 characters for values 0..9
     arr = np.asarray(grid)
     lines = []
     for row in arr:
-        chars = []
-        for v in row:
-            v_int = int(v)
-            if 0 <= v_int < len(palette):
-                chars.append(palette[v_int])
-            else:
-                chars.append("?")
-        lines.append("".join(chars))
+        # use fixed width so columns align a bit
+        lines.append(" ".join(f"{int(v):2d}" for v in row))
     return "\n".join(lines)
 
 

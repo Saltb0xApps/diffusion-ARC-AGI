@@ -15,6 +15,9 @@ from datasets import load_dataset
 
 from arc_model import ArcFlux
 from arc_dataset import ArcHFDataset
+from diffusers.utils import logging as diffusers_logging
+
+diffusers_logging.set_verbosity_error()
 
 # Silence most torch-related warnings
 warnings.filterwarnings("ignore", category=UserWarning, module=r"torch.*")
@@ -23,10 +26,10 @@ warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch.*")
 
 def parse_args():
     p = argparse.ArgumentParser("Train ArcFlux on ARC-AGI-1 with W&B logging")
-    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight_decay", type=float, default=5e-5)
+    p.add_argument("--weight_decay", type=float, default=1e-3)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--save_dir", type=str, default="checkpoints_arc")
 
@@ -37,7 +40,7 @@ def parse_args():
                    help="Disable wandb logging")
 
     # eval settings
-    p.add_argument("--eval_steps", type=int, default=32,
+    p.add_argument("--eval_steps", type=int, default=64,
                    help="Diffusion steps to use for full eval")
     p.add_argument("--full_eval_interval", type=int, default=5,
                    help="Run full eval every N epochs (default 5)")
@@ -101,23 +104,14 @@ def grids_equal(a, b):
 
 def grid_to_ascii(grid):
     """
-    Convert a 2D grid of integers into simple ASCII art.
-    Values 0..9 are mapped to a fixed palette.
+    Represent a 2D integer grid as a string of numbers, one row per line.
     """
-    palette = " .,:;ox%#@"  # 10 characters for values 0..9
     arr = np.asarray(grid)
     lines = []
     for row in arr:
-        chars = []
-        for v in row:
-            v_int = int(v)
-            if 0 <= v_int < len(palette):
-                chars.append(palette[v_int])
-            else:
-                chars.append("?")
-        lines.append("".join(chars))
+        # use fixed width so columns align a bit
+        lines.append(" ".join(f"{int(v):2d}" for v in row))
     return "\n".join(lines)
-
 
 def evaluate_accuracy_full(
     model: ArcFlux,
@@ -202,14 +196,16 @@ def main():
 
     # --- datasets ---
     train_dataset = ArcHFDataset(
-        split="training",
+        split="train",
         use_test_targets=True,
         pad_token_id=10,
+        dataset_id="Asap7772/arc-agi-mixed-barc",
     )
     eval_dataset = ArcHFDataset(
         split="evaluation",
         use_test_targets=True,
         pad_token_id=10,
+        dataset_id="dataartist/arc-agi",
     )
 
     train_loader = DataLoader(
