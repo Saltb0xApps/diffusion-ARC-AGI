@@ -1,6 +1,9 @@
+# train_arc.py
+
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import warnings
 import random
@@ -27,8 +30,8 @@ warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch.*")
 def parse_args():
     p = argparse.ArgumentParser("Train ArcFlux on ARC-AGI-1 with W&B logging")
     p.add_argument("--epochs", type=int, default=300)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--weight_decay", type=float, default=1e-3)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--save_dir", type=str, default="checkpoints_arc")
@@ -42,13 +45,49 @@ def parse_args():
     # eval settings
     p.add_argument("--eval_steps", type=int, default=64,
                    help="Diffusion steps to use for full eval")
-    p.add_argument("--full_eval_interval", type=int, default=5,
-                   help="Run full eval every N epochs (default 5)")
+    p.add_argument("--full_eval_interval", type=int, default=3,
+                   help="Run full eval every N epochs (default 3)")
+
+    # speed / precision
+    p.add_argument(
+        "--precision",
+        type=str,
+        default="bf16",
+        choices=["fp32", "bf16", "fp16"],
+        help="AMP precision for forward pass (weights stay fp32).",
+    )
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="Use torch.compile on the model if available.",
+    )
+    p.add_argument(
+        "--no_grad_checkpoint",
+        action="store_true",
+        help="Disable gradient checkpointing (uses more VRAM, but faster).",
+    )
 
     return p.parse_args()
 
 
-def build_model(device: torch.device) -> ArcFlux:
+def get_autocast(device: torch.device, use_amp: bool, amp_dtype: torch.dtype):
+    """
+    Small helper so we can write:
+
+        with get_autocast(device, use_amp, amp_dtype):
+            ...
+
+    and it’s a no-op if AMP is disabled or not on CUDA.
+    """
+    if not use_amp or device.type != "cuda":
+        return contextlib.nullcontext()
+    return torch.autocast(device_type="cuda", dtype=amp_dtype)
+
+
+def build_model(
+    device: torch.device,
+    use_grad_checkpointing: bool = False,
+) -> ArcFlux:
     model_config = {
         "num_layers": 6,
         "num_single_layers": 18,
@@ -63,14 +102,20 @@ def build_model(device: torch.device) -> ArcFlux:
     }
     model = ArcFlux(model_config).to(device)
 
-    # gradient checkpointing saves memory
-    if hasattr(model.transformer, "enable_gradient_checkpointing"):
+    # gradient checkpointing saves memory but costs speed
+    if use_grad_checkpointing and hasattr(model.transformer, "enable_gradient_checkpointing"):
         model.transformer.enable_gradient_checkpointing()
 
     return model
 
 
-def evaluate_loss(model: ArcFlux, dataloader: DataLoader, device: torch.device) -> float:
+def evaluate_loss(
+    model: ArcFlux,
+    dataloader: DataLoader,
+    device: torch.device,
+    use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.float32,
+) -> float:
     model.eval()
     total_loss = 0.0
     n_batches = 0
@@ -82,7 +127,9 @@ def evaluate_loss(model: ArcFlux, dataloader: DataLoader, device: torch.device) 
             prefix_lens = prefix_lens.to(device)
             target_mask = target_mask.to(device)
 
-            loss = model(seq_ids, prefix_lens, target_mask)
+            with get_autocast(device, use_amp, amp_dtype):
+                loss = model(seq_ids, prefix_lens, target_mask)
+
             total_loss += loss.item()
             n_batches += 1
 
@@ -113,10 +160,13 @@ def grid_to_ascii(grid):
         lines.append(" ".join(f"{int(v):2d}" for v in row))
     return "\n".join(lines)
 
+
 def evaluate_accuracy_full(
     model: ArcFlux,
     device: torch.device,
     num_steps: int = 32,
+    use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.float32,
 ) -> float:
     """
     Full accuracy eval on ARC-AGI-1 evaluation split, like eval_arc.py,
@@ -154,12 +204,14 @@ def evaluate_accuracy_full(
 
                 prefix_ids = inp.view(1, -1).to(device)  # (1, L_prefix)
 
-                pred_ids = model.sample_with_prefix(
-                    prefix_ids,
-                    out_height=H_out,
-                    out_width=W_out,
-                    num_inference_steps=num_steps,
-                )
+                with get_autocast(device, use_amp, amp_dtype):
+                    pred_ids = model.sample_with_prefix(
+                        prefix_ids,
+                        out_height=H_out,
+                        out_width=W_out,
+                        num_inference_steps=num_steps,
+                    )
+
                 pred_grid = pred_ids.cpu().numpy()[0].tolist()
 
                 is_correct = grids_equal(pred_grid, gt_out)
@@ -191,15 +243,36 @@ def evaluate_accuracy_full(
 def main():
     args = parse_args()
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    is_cuda = torch.cuda.is_available() and args.device.startswith("cuda")
+    device = torch.device(args.device if is_cuda else "cpu")
     os.makedirs(args.save_dir, exist_ok=True)
+
+    # Global backend knobs for speed
+    if is_cuda:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+    # AMP configuration
+    if args.precision == "bf16":
+        amp_dtype = torch.bfloat16
+    elif args.precision == "fp16":
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.float32
+
+    use_amp = (amp_dtype != torch.float32) and is_cuda
+    use_scaler = (args.precision == "fp16") and is_cuda
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     # --- datasets ---
     train_dataset = ArcHFDataset(
-        split="train",
+        split="training",
         use_test_targets=True,
         pad_token_id=10,
-        dataset_id="Asap7772/arc-agi-mixed-barc",
+        dataset_id="dataartist/arc-agi",
     )
     eval_dataset = ArcHFDataset(
         split="evaluation",
@@ -226,7 +299,19 @@ def main():
     )
 
     # --- model + optimizer ---
-    model = build_model(device)
+    model = build_model(
+        device,
+        use_grad_checkpointing=False,
+    )
+
+    # torch.compile (optional)
+    if args.compile and hasattr(torch, "compile") and is_cuda:
+        try:
+            model = torch.compile(model)
+            print("Model compiled with torch.compile()")
+        except Exception as e:
+            print(f"WARNING: torch.compile failed: {e}. Continuing without compile.")
+
     optimizer = AdamW(
         model.parameters(),
         lr=args.lr,
@@ -246,6 +331,9 @@ def main():
                 "weight_decay": args.weight_decay,
                 "eval_steps": args.eval_steps,
                 "full_eval_interval": args.full_eval_interval,
+                "precision": args.precision,
+                "compile": args.compile,
+                "grad_checkpointing": not args.no_grad_checkpoint,
             },
         )
         wandb.watch(model, log="gradients", log_freq=100)
@@ -264,11 +352,23 @@ def main():
             prefix_lens = prefix_lens.to(device)
             target_mask = target_mask.to(device)
 
-            optimizer.zero_grad()
-            loss = model(seq_ids, prefix_lens, target_mask)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            with get_autocast(device, use_amp, amp_dtype):
+                loss = model(seq_ids, prefix_lens, target_mask)
+
+            if use_scaler:
+                # fp16 with GradScaler
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # fp32 or bf16 path
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
             global_step += 1
             running_loss += loss.item()
@@ -280,7 +380,13 @@ def main():
 
         # --- end-of-epoch eval loss (always) ---
         avg_train_loss = running_loss / max(global_step, 1)
-        eval_loss = evaluate_loss(model, eval_loader, device)
+        eval_loss = evaluate_loss(
+            model,
+            eval_loader,
+            device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+        )
 
         epoch_num = epoch + 1
         run_full_eval = (
@@ -290,7 +396,11 @@ def main():
 
         if run_full_eval:
             eval_acc = evaluate_accuracy_full(
-                model, device, num_steps=args.eval_steps
+                model,
+                device,
+                num_steps=args.eval_steps,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
             )
             print(
                 f"Epoch {epoch_num}: "
