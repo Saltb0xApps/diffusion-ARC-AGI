@@ -1,9 +1,11 @@
-# train_arc.py
 from __future__ import annotations
 
 import argparse
 import os
+import warnings
+import random
 
+import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -13,6 +15,10 @@ from datasets import load_dataset
 
 from arc_model import ArcFlux
 from arc_dataset import ArcHFDataset
+
+# Silence most torch-related warnings
+warnings.filterwarnings("ignore", category=UserWarning, module=r"torch.*")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch.*")
 
 
 def parse_args():
@@ -33,8 +39,8 @@ def parse_args():
     # eval settings
     p.add_argument("--eval_steps", type=int, default=32,
                    help="Diffusion steps to use for full eval")
-    p.add_argument("--full_eval_interval", type=int, default=2,
-                   help="Run full eval every N epochs (default 2)")
+    p.add_argument("--full_eval_interval", type=int, default=5,
+                   help="Run full eval every N epochs (default 5)")
 
     return p.parse_args()
 
@@ -93,6 +99,26 @@ def grids_equal(a, b):
     return True
 
 
+def grid_to_ascii(grid):
+    """
+    Convert a 2D grid of integers into simple ASCII art.
+    Values 0..9 are mapped to a fixed palette.
+    """
+    palette = " .,:;ox%#@"  # 10 characters for values 0..9
+    arr = np.asarray(grid)
+    lines = []
+    for row in arr:
+        chars = []
+        for v in row:
+            v_int = int(v)
+            if 0 <= v_int < len(palette):
+                chars.append(palette[v_int])
+            else:
+                chars.append("?")
+        lines.append("".join(chars))
+    return "\n".join(lines)
+
+
 def evaluate_accuracy_full(
     model: ArcFlux,
     device: torch.device,
@@ -101,16 +127,31 @@ def evaluate_accuracy_full(
     """
     Full accuracy eval on ARC-AGI-1 evaluation split, like eval_arc.py,
     but without writing JSON to disk.
+
+    Modified to:
+      - evaluate on 40 random evaluation tasks
+      - print ASCII art of input, prediction and ground truth
     """
     model.eval()
     ds_eval = load_dataset("dataartist/arc-agi")["evaluation"]
+
+    MAX_TASKS = 40  # evaluate on 40 random tasks from the 400-task evaluation split
+
+    num_tasks = len(ds_eval)
+    k = min(MAX_TASKS, num_tasks)
+
+    rng = random.Random(42)  # fixed seed for reproducibility; change if desired
+    selected_indices = rng.sample(range(num_tasks), k=k)
 
     total = 0
     correct = 0
 
     with torch.no_grad():
-        for row in ds_eval:
-            for test_pair in row["test"]:
+        for idx in selected_indices:
+            row = ds_eval[idx]
+            task_id = row["id"]
+
+            for i, test_pair in enumerate(row["test"]):
                 inp = torch.tensor(test_pair["input"], dtype=torch.long)   # (H_in, W_in)
                 gt_out = test_pair["output"]
 
@@ -127,12 +168,30 @@ def evaluate_accuracy_full(
                 )
                 pred_grid = pred_ids.cpu().numpy()[0].tolist()
 
-                if grids_equal(pred_grid, gt_out):
+                is_correct = grids_equal(pred_grid, gt_out)
+                if is_correct:
                     correct += 1
                 total += 1
 
+                # ASCII art printout
+                print(f"\n[Full eval] Task {task_id} (idx {idx}) - test {i} - {'CORRECT' if is_correct else 'WRONG'}")
+                print("INPUT:")
+                print(grid_to_ascii(test_pair["input"]))
+                print("\nPREDICTED:")
+                print(grid_to_ascii(pred_grid))
+                print("\nGROUND TRUTH:")
+                print(grid_to_ascii(gt_out))
+                print("-" * 40)
+
+    acc = correct / max(total, 1)
+    print(
+        f"\n[Full eval] Exact grid accuracy on random subset of evaluation split "
+        f"({k} tasks out of {num_tasks}): "
+        f"{acc*100:.2f}% ({correct}/{total})"
+    )
+
     model.train()
-    return correct / max(total, 1)
+    return acc
 
 
 def main():
@@ -197,9 +256,9 @@ def main():
 
     # --- training loop ---
     global_step = 0
+    running_loss = 0.0
     for epoch in range(args.epochs):
         model.train()
-        running_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
 
         for batch in pbar:
