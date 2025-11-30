@@ -167,14 +167,15 @@ def evaluate_accuracy_full(
     num_steps: int = 32,
     use_amp: bool = False,
     amp_dtype: torch.dtype = torch.float32,
-) -> float:
+) -> tuple[float, float]:
     """
     Full accuracy eval on ARC-AGI-1 evaluation split, like eval_arc.py,
     but without writing JSON to disk.
 
-    Modified to:
-      - evaluate on 40 random evaluation tasks
-      - print ASCII art of input, prediction and ground truth
+    Returns:
+        grid_acc: exact grid match accuracy (#perfect grids / #grids)
+        cell_acc: per-cell accuracy over all grids
+                  (#correct cells / #total cells)
     """
     model.eval()
     ds_eval = load_dataset("dataartist/arc-agi")["evaluation"]
@@ -187,8 +188,13 @@ def evaluate_accuracy_full(
     rng = random.Random(42)  # fixed seed for reproducibility; change if desired
     selected_indices = rng.sample(range(num_tasks), k=k)
 
-    total = 0
-    correct = 0
+    # exact-grid stats
+    total_grids = 0
+    correct_grids = 0
+
+    # per-cell stats
+    cell_correct = 0
+    cell_total = 0
 
     with torch.no_grad():
         for idx in selected_indices:
@@ -214,13 +220,29 @@ def evaluate_accuracy_full(
 
                 pred_grid = pred_ids.cpu().numpy()[0].tolist()
 
+                # ----- exact-grid metric -----
                 is_correct = grids_equal(pred_grid, gt_out)
-                if is_correct:
-                    correct += 1
-                total += 1
+                correct_grids += int(is_correct)
+                total_grids += 1
+
+                # ----- per-cell metric -----
+                gt_arr = np.asarray(gt_out)
+                pred_arr = np.asarray(pred_grid)
+
+                if gt_arr.shape == pred_arr.shape:
+                    matches = (gt_arr == pred_arr)
+                else:
+                    # if shapes disagree, count all GT cells as incorrect
+                    matches = np.zeros_like(gt_arr, dtype=bool)
+
+                cell_correct += int(matches.sum())
+                cell_total += int(matches.size)
 
                 # ASCII art printout
-                print(f"\n[Full eval] Task {task_id} (idx {idx}) - test {i} - {'CORRECT' if is_correct else 'WRONG'}")
+                print(
+                    f"\n[Full eval] Task {task_id} (idx {idx}) - test {i} - "
+                    f"{'CORRECT' if is_correct else 'WRONG'}"
+                )
                 print("INPUT:")
                 print(grid_to_ascii(test_pair["input"]))
                 print("\nPREDICTED:")
@@ -229,15 +251,21 @@ def evaluate_accuracy_full(
                 print(grid_to_ascii(gt_out))
                 print("-" * 40)
 
-    acc = correct / max(total, 1)
+    grid_acc = correct_grids / max(total_grids, 1)
+    cell_acc = cell_correct / max(cell_total, 1)
+
     print(
         f"\n[Full eval] Exact grid accuracy on random subset of evaluation split "
         f"({k} tasks out of {num_tasks}): "
-        f"{acc*100:.2f}% ({correct}/{total})"
+        f"{grid_acc*100:.2f}% ({correct_grids}/{total_grids})"
+    )
+    print(
+        f"[Full eval] Per-cell accuracy over all grids: "
+        f"{cell_acc*100:.2f}% ({cell_correct}/{cell_total})"
     )
 
     model.train()
-    return acc
+    return grid_acc, cell_acc
 
 
 def main():
@@ -265,6 +293,8 @@ def main():
 
     use_amp = (amp_dtype != torch.float32) and is_cuda
     use_scaler = (args.precision == "fp16") and is_cuda
+    use_amp_train = use_amp           # for training & eval_loss
+    use_amp_eval = False              # force fp32 for full eval sampling
     scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     # --- datasets ---
@@ -336,7 +366,7 @@ def main():
                 "grad_checkpointing": not args.no_grad_checkpoint,
             },
         )
-        wandb.watch(model, log="gradients", log_freq=100)
+        # wandb.watch(model, log="gradients", log_freq=100)
 
     # --- training loop ---
     global_step = 0
@@ -384,7 +414,7 @@ def main():
             model,
             eval_loader,
             device,
-            use_amp=use_amp,
+            use_amp=use_amp_train,
             amp_dtype=amp_dtype,
         )
 
@@ -395,21 +425,23 @@ def main():
         )
 
         if run_full_eval:
-            eval_acc = evaluate_accuracy_full(
+            eval_grid_acc, eval_cell_acc = evaluate_accuracy_full(
                 model,
                 device,
                 num_steps=args.eval_steps,
-                use_amp=use_amp,
-                amp_dtype=amp_dtype,
+                use_amp=use_amp_eval,          # fp32 eval for stability
+                amp_dtype=torch.float32,
             )
             print(
                 f"Epoch {epoch_num}: "
                 f"train_loss={avg_train_loss:.4f}, "
                 f"eval_loss={eval_loss:.4f}, "
-                f"FULL eval_acc={eval_acc*100:.2f}%"
+                f"FULL grid_acc={eval_grid_acc*100:.2f}%, "
+                f"cell_acc={eval_cell_acc*100:.2f}%"
             )
         else:
-            eval_acc = None
+            eval_grid_acc = None
+            eval_cell_acc = None
             print(
                 f"Epoch {epoch_num}: "
                 f"train_loss={avg_train_loss:.4f}, "
@@ -424,8 +456,10 @@ def main():
                 "eval/loss_epoch": eval_loss,
                 "step": global_step,
             }
-            if eval_acc is not None:
-                log_dict["eval/accuracy_full_epoch"] = eval_acc
+            if eval_grid_acc is not None:
+                log_dict["eval/accuracy_full_epoch"] = eval_grid_acc
+            if eval_cell_acc is not None:
+                log_dict["eval/accuracy_cell_epoch"] = eval_cell_acc
             wandb.log(log_dict)
 
         # --- checkpoint ---

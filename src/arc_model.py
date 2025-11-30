@@ -223,8 +223,10 @@ class ArcFlux(nn.Module):
         flow_target = noise - latents
 
         mse = (model_pred.float() - flow_target.float()) ** 2
-        mse = mse * target_mask_3d.float()     # ignore prefix & PAD
-        loss = mse.mean()
+        mse = mse * target_mask_3d.float()
+
+        denom = target_mask_3d.float().sum().clamp(min=1.0)
+        loss = mse.sum() / denom
 
         return loss
 
